@@ -90,6 +90,9 @@ class Config:
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
         )
 
+        # Groq API key for Whisper speech-to-text
+        self.groq_api_key: str = os.getenv("GROQ_API_KEY", "")
+
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
             "tmux_session=%s, claude_projects_path=%s",

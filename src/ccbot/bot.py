@@ -490,7 +490,7 @@ async def unsupported_content_handler(
     update: Update,
     _context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Reply to non-text messages (images, stickers, voice, etc.)."""
+    """Reply to non-text messages (stickers, video, etc.)."""
     if not update.message:
         return
     user = update.effective_user
@@ -499,7 +499,7 @@ async def unsupported_content_handler(
     logger.debug("Unsupported content from user %d", user.id)
     await safe_reply(
         update.message,
-        "⚠ Only text messages are supported. Images, stickers, voice, and other media cannot be forwarded to Claude Code.",
+        "⚠ Only text, images, and voice messages are supported. Stickers, video, and other media cannot be forwarded to Claude Code.",
     )
 
 
@@ -577,6 +577,126 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Confirm to user
     await safe_reply(update.message, "📷 Image sent to Claude Code.")
+
+
+# --- Audio directory for incoming voice messages ---
+_AUDIO_DIR = ccbot_dir() / "audio"
+_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+
+
+async def transcribe_with_groq(audio_path: Path) -> str | None:
+    """Transcribe audio file using Groq Whisper API."""
+    import httpx
+
+    api_key = config.groq_api_key
+    if not api_key:
+        logger.error("GROQ_API_KEY not set, cannot transcribe voice message")
+        return None
+
+    try:
+        async with httpx.AsyncClient() as client:
+            with open(audio_path, "rb") as f:
+                response = await client.post(
+                    "https://api.groq.com/openai/v1/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    files={"file": (audio_path.name, f, "audio/ogg")},
+                    data={"model": "whisper-large-v3"},
+                    timeout=60.0,
+                )
+
+            if response.status_code == 200:
+                return response.json().get("text", "")
+            else:
+                logger.error("Groq API error: %s %s", response.status_code, response.text)
+                return None
+    except Exception as e:
+        logger.error("Failed to transcribe audio: %s", e)
+        return None
+
+
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle voice messages: transcribe with Groq Whisper and forward to Claude Code."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        if update.message:
+            await safe_reply(update.message, "You are not authorized to use this bot.")
+        return
+
+    if not update.message or not update.message.voice:
+        return
+
+    chat = update.message.chat
+    thread_id = _get_thread_id(update)
+    if chat.type in ("group", "supergroup") and thread_id is not None:
+        session_manager.set_group_chat_id(user.id, thread_id, chat.id)
+
+    # Must be in a named topic
+    if thread_id is None:
+        await safe_reply(
+            update.message,
+            "❌ Please use a named topic. Create a new topic to start a session.",
+        )
+        return
+
+    wid = session_manager.get_window_for_thread(user.id, thread_id)
+    if wid is None:
+        await safe_reply(
+            update.message,
+            "❌ No session bound to this topic. Send a text message first to create one.",
+        )
+        return
+
+    w = await tmux_manager.find_window_by_id(wid)
+    if not w:
+        display = session_manager.get_display_name(wid)
+        session_manager.unbind_thread(user.id, thread_id)
+        await safe_reply(
+            update.message,
+            f"❌ Window '{display}' no longer exists. Binding removed.\n"
+            "Send a message to start a new session.",
+        )
+        return
+
+    # Check if Groq API key is configured
+    if not config.groq_api_key:
+        await safe_reply(
+            update.message,
+            "❌ Voice messages not supported. GROQ_API_KEY not configured.",
+        )
+        return
+
+    # Download the voice file
+    voice = update.message.voice
+    tg_file = await voice.get_file()
+
+    # Save to ~/.ccbot/audio/<timestamp>_<file_unique_id>.ogg
+    filename = f"{int(time.time())}_{voice.file_unique_id}.ogg"
+    file_path = _AUDIO_DIR / filename
+    await tg_file.download_to_drive(file_path)
+
+    # Notify user that transcription is in progress
+    await safe_reply(update.message, "🎙️ Transcribing voice message...")
+
+    # Transcribe with Groq Whisper
+    transcript = await transcribe_with_groq(file_path)
+
+    if not transcript:
+        await safe_reply(update.message, "❌ Failed to transcribe voice message.")
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    clear_status_msg_info(user.id, thread_id)
+
+    # Send transcribed text to Claude Code
+    text_to_send = f"(voice message transcribed): {transcript}"
+    success, message = await session_manager.send_to_window(wid, text_to_send)
+
+    if not success:
+        await safe_reply(update.message, f"❌ {message}")
+        return
+
+    # Confirm to user with the transcript
+    await safe_reply(update.message, f"🎙️ Voice sent to Claude Code:\n\n_{transcript}_")
 
 
 # Active bash capture tasks: (user_id, thread_id) → asyncio.Task
@@ -1593,7 +1713,9 @@ def create_bot() -> Application:
     )
     # Photos: download and forward file path to Claude Code
     application.add_handler(MessageHandler(filters.PHOTO, photo_handler))
-    # Catch-all: non-text content (stickers, voice, etc.)
+    # Voice: transcribe with Groq Whisper and forward to Claude Code
+    application.add_handler(MessageHandler(filters.VOICE, voice_handler))
+    # Catch-all: non-text content (stickers, etc.)
     application.add_handler(
         MessageHandler(
             ~filters.COMMAND & ~filters.TEXT & ~filters.StatusUpdate.ALL,
